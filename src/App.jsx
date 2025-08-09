@@ -1,38 +1,64 @@
-import { useEffect, useMemo, useState } from "react";
-import { BrowserRouter, Routes, Route, useNavigate } from "react-router-dom";
+// src/App.jsx
+import { useEffect, useState, Suspense, lazy } from "react";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import dayjs from "dayjs";
+
 import SearchBar from "./components/SearchBar.jsx";
 import UnitToggle from "./components/UnitToggle.jsx";
 import WeatherCard from "./components/WeatherCard.jsx";
 import Forecast from "./components/Forecast.jsx";
 import Profile from "./components/Profile.jsx";
 import WelcomeToast from "./components/WelcomeToast.jsx";
-import AdminLogin from "./admin/AdminLogin.jsx";
-import AdminDashboard from "./admin/AdminDashboard.jsx";
-import { fetchCoords, fetchOneCall } from "./api.js";
+
+import { fetchCoords, fetchOneCall, analyzeRainToday } from "./api.js";
 import {
   ensureAnon, upsertUserProfile, trackVisit, trackSearch,
   watchSettings, watchAds
 } from "./lib/firebaseStore";
 
-import {
-  getOrCreateVisitor, upsertUser, getSettings, listAds
-} from "./lib/store";
+// Lazy-load admin pages so they don't affect the home page on errors
+const AdminLogin = lazy(() => import("./admin/AdminLogin.jsx"));
+const AdminDashboard = lazy(() => import("./admin/AdminDashboard.jsx"));
 
+/* -------------------------
+   Home page (main weather)
+--------------------------*/
 function Home() {
   const [units, setUnits] = useState("metric");
   const [place, setPlace] = useState("Accra, GH");
   const [coords, setCoords] = useState(null);
   const [data, setData] = useState(null);
+  const [rainInfo, setRainInfo] = useState(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [profile, setProfile] = useState({ name: "", photo: "" });
   const [showWelcome, setShowWelcome] = useState(false);
-  const visitorId = useMemo(() => getOrCreateVisitor(), []);
-  const settings = getSettings();
-  const ads = listAds().filter(a => a.active);
 
-  // dynamic bg
+  const [settings, setSettings] = useState({ siteName: "Weatherfals", logoUrl: "" });
+  const [ads, setAds] = useState([]);
+
+  // sign in anon, load profile from localStorage
+  useEffect(() => {
+    ensureAnon().then(trackVisit);
+    try {
+      const raw = localStorage.getItem("weather_profile");
+      if (raw) {
+        const p = JSON.parse(raw);
+        setProfile({ name: p.name || "", photo: p.photo || "" });
+        if (p.name) setShowWelcome(true);
+        upsertUserProfile({ name: p.name || "Guest", photo: p.photo || "" });
+      }
+    } catch {}
+  }, []);
+
+  // watch site settings & ads from Firestore
+  useEffect(() => {
+    const unS = watchSettings(setSettings);
+    const unA = watchAds(setAds);
+    return () => { unS(); unA(); };
+  }, []);
+
+  // dynamic background based on weather
   function getBgUrl(code, desc = "") {
     const text = (desc || "").toLowerCase();
     const u = (q) => `https://images.unsplash.com/${q}?auto=format&fit=crop&w=1920&q=80`;
@@ -51,39 +77,30 @@ function Home() {
     document.documentElement.style.setProperty("--bg-url", `url("${url}")`);
   }, [data]);
 
-  // profile load + greeting + sync to users
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem("weather_profile");
-      if (raw) {
-        const p = JSON.parse(raw);
-        setProfile({ name: p.name || "", photo: p.photo || "" });
-        if (p.name) setShowWelcome(true);
-        upsertUser({ id: visitorId, name: p.name || "Guest", photo: p.photo || "", lastSeen: Date.now() });
-      }
-    } catch {}
-  }, [visitorId]);
-
-  // search by city
+  // search
   async function loadByCity(city) {
-    try { setErr(""); setLoading(true);
-      const c = await fetchCoords(city);
+    try {
+      setErr(""); setLoading(true);
+      const c = await fetchCoords((city || "").trim());
       setCoords({ lat: c.lat, lon: c.lon });
       setPlace(c.label);
-      trackSearch(visitorId, city);
-    } catch (e) { setErr(e.message); }
-    finally { setLoading(false); }
-  }
-  // weather fetch
-  async function loadWeather(c) {
-    try { setErr(""); setLoading(true);
-      const res = await fetchOneCall({ ...c, units });
-      setData(res);
+      await trackSearch(city);
     } catch (e) { setErr(e.message); }
     finally { setLoading(false); }
   }
 
-  // geolocation first hit
+  // weather load
+  async function loadWeather(c) {
+    try {
+      setErr(""); setLoading(true);
+      const res = await fetchOneCall({ ...c, units });
+      setData(res);
+      setRainInfo(analyzeRainToday(res));
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  }
+
+  // first location
   useEffect(() => {
     const done = (lat, lon) => { setCoords({ lat, lon }); setPlace("Your location"); };
     if (navigator.geolocation) {
@@ -99,15 +116,16 @@ function Home() {
   return (
     <div className="page">
       <WelcomeToast name={profile.name} show={showWelcome && !!profile.name} onClose={()=>setShowWelcome(false)} />
+
       <header className="header row space-between">
         <div className="row" style={{ gap: 12 }}>
-          <img alt="Weatherfals logo" src="/weatherfals-logo.png" style={{ height: 32, borderRadius: 6 }} />
+          {settings.logoUrl && <img alt="logo" src={settings.logoUrl} style={{ height:32, borderRadius:6 }} />}
           <h1 className="logo">{settings.siteName || "Weatherfals"}</h1>
           {profile?.name && <div className="hello muted">Hi, {profile.name}</div>}
         </div>
         <div className="row" style={{ gap: 12 }}>
           <UnitToggle units={units} setUnits={setUnits} />
-          <Profile profile={profile} setProfile={(p)=>{ setProfile(p); upsertUser({ id: visitorId, name:p.name||"Guest", photo:p.photo||"", lastSeen:Date.now() }); }} />
+          <Profile profile={profile} setProfile={(p)=>{ setProfile(p); upsertUserProfile({ name:p.name||"Guest", photo:p.photo||"" }); }} />
         </div>
       </header>
 
@@ -115,21 +133,45 @@ function Home() {
         <SearchBar onSearch={loadByCity} />
         {loading && <div className="info">Loading…</div>}
         {err && <div className="error">{err}</div>}
+
         {data && (
           <>
             <WeatherCard place={place} current={data.current} units={units} />
-            {/* Ad slot */}
+
+            {/* Rain today banner */}
+            {rainInfo && (
+              <div className="card" style={{ marginTop: 12 }}>
+                {rainInfo.willRain ? (
+                  <div>
+                    🌧️ <b>Rain today</b>
+                    {rainInfo.when && <> around <b>{rainInfo.when}</b></>}
+                    {` — chance ~${rainInfo.chance}%`}
+                    {rainInfo.amount > 0 && <> (≈ {rainInfo.amount.toFixed(1)} mm)</>}
+                  </div>
+                ) : (
+                  <div>☀️ <b>No rain expected today</b> (chance ≤ {Math.max(5, rainInfo.chance)}%).</div>
+                )}
+              </div>
+            )}
+
+            {/* Ads */}
             {!!ads.length && (
               <div className="grid" style={{ marginTop:12 }}>
                 {ads.map(a=>(
                   <a key={a.id} className="card mini" href={a.linkUrl} target="_blank" rel="noreferrer">
                     <div style={{ fontWeight:700 }}>{a.title}</div>
-                    {a.imageUrl && <img alt="" src={a.imageUrl} style={{ width:"100%", borderRadius:8, marginTop:6 }}/>}
+                    {a.mediaUrl
+                      ? (a.mediaType === "video"
+                          ? <video src={a.mediaUrl} controls style={{ width:"100%", borderRadius:8, marginTop:6 }} />
+                          : <img alt={a.title} src={a.mediaUrl} style={{ width:"100%", borderRadius:8, marginTop:6 }} />)
+                      : null}
                   </a>
                 ))}
               </div>
             )}
+
             <Forecast daily={data.daily} units={units} />
+
             <div className="card" style={{ marginTop: 12 }}>
               <div className="row wrap">
                 <div>Pressure: {data.current.pressure ?? "—"} hPa</div>
@@ -145,14 +187,19 @@ function Home() {
   );
 }
 
-export default function App(){
+/* -------------------------
+   App router with admin
+--------------------------*/
+export default function AppRouter() {
   return (
     <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<Home/>} />
-        <Route path="/adminverifys/" element={<AdminLogin/>} />
-        <Route path="/admin/dashboard" element={<AdminDashboard/>} />
-      </Routes>
+      <Suspense fallback={<div className="info" style={{ padding:16 }}>Loading…</div>}>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/adminverifys/" element={<AdminLogin />} />
+          <Route path="/admin/dashboard" element={<AdminDashboard />} />
+        </Routes>
+      </Suspense>
     </BrowserRouter>
   );
 }
