@@ -78,52 +78,61 @@ export async function fetchByCity(city, units = "metric") {
 }
 
 // ---------- NEW: rain today analysis ----------
-export function analyzeRainToday(onecall) {
-  if (!onecall?.hourly?.length) return { willRain: false, chance: 0, when: "", amount: 0 };
+// Stronger "rain today" analyzer:
+// 1) Use daily[0].pop / daily[0].rain first (covers “today” cleanly).
+// 2) Use hourly to estimate the first rainy hour (fallback-safe).
 
+export function analyzeRainToday(onecall) {
+  if (!onecall) return { willRain: false, chance: 0, when: "", amount: 0 };
+
+  const daily0 = onecall.daily?.[0] || null;
+  let chance = 0;
+  let amount = 0;
+
+  if (daily0) {
+    // daily.pop is 0..1 probability for the *day*
+    chance = Math.round(((daily0.pop ?? 0) * 100));
+    // daily.rain may be total mm for the day
+    amount = Number.isFinite(daily0.rain) ? daily0.rain : 0;
+  }
+
+  // Try to find the first rainy hour for "when"
+  let when = "";
   const offset = onecall.timezone_offset || 0; // seconds
   const nowUtc = Math.floor(Date.now() / 1000);
-  const nowLocal = nowUtc + offset;
-  const d = new Date(nowLocal * 1000);
+  const endUtc = nowUtc + 24 * 3600; // next 24h window
 
-  // start of today's local day -> back to UTC secs
-  const startLocal = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) / 1000;
-  const startUtc = startLocal - offset;
-  const endUtc = startUtc + 86400;
+  if (onecall.hourly?.length) {
+    for (const h of onecall.hourly) {
+      if (h.dt < nowUtc || h.dt > endUtc) continue;
+      const pop = h.pop ?? 0;
+      const code = h.weather?.[0]?.id || 0;
+      const hrAmount = (h.rain?.["1h"] ?? 0) + (h.snow?.["1h"] ?? 0);
+      const rainyCode = code >= 200 && code < 600;
 
-  let maxPop = 0;
-  let firstRainHour = null;
-  let firstAmount = 0;
+      // pick a modest threshold to indicate likely rain in an hour
+      if (rainyCode || hrAmount > 0 || pop >= 0.3) {
+        const t = new Date((h.dt + offset) * 1000);
+        const hh = t.getUTCHours().toString().padStart(2, "0");
+        const mm = t.getUTCMinutes().toString().padStart(2, "0");
+        when = `${hh}:${mm}`;
+        // If we had no daily amount, use the first hour amount as a hint
+        if (!amount && hrAmount) amount = hrAmount;
+        break;
+      }
+    }
 
-  for (const h of onecall.hourly) {
-    if (h.dt < startUtc || h.dt >= endUtc) continue;
-    const code = h.weather?.[0]?.id || 0;
-    const amount = (h.rain?.["1h"] ?? 0) + (h.snow?.["1h"] ?? 0);
-    const looksRainy = code >= 200 && code < 600; // thunder (2xx), drizzle (3xx), rain (5xx)
-    const pop = h.pop ?? 0;
-
-    if (pop > maxPop) maxPop = pop;
-
-    if (!firstRainHour && (looksRainy || amount > 0 || pop >= 0.3)) {
-      firstRainHour = h.dt;
-      firstAmount = amount;
+    // If daily0 missing, backfill chance from the max hourly pop in 24h
+    if (!daily0) {
+      let maxPop = 0;
+      for (const h of onecall.hourly) {
+        if (h.dt < nowUtc || h.dt > endUtc) continue;
+        maxPop = Math.max(maxPop, h.pop ?? 0);
+      }
+      chance = Math.round(maxPop * 100);
     }
   }
 
-  const willRain = !!firstRainHour || maxPop >= 0.5;
-
-  let whenText = "";
-  if (firstRainHour) {
-    const t = new Date((firstRainHour + offset) * 1000);
-    const hh = t.getUTCHours().toString().padStart(2, "0");
-    const mm = t.getUTCMinutes().toString().padStart(2, "0");
-    whenText = `${hh}:${mm}`; // local time of the location
-  }
-
-  return {
-    willRain,
-    chance: Math.round(maxPop * 100),
-    when: whenText,
-    amount: firstAmount,
-  };
+  const willRain = chance >= 30 || amount > 0 || when !== "";
+  return { willRain, chance, when, amount };
 }

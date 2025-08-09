@@ -90,15 +90,23 @@ function Home() {
   }
 
   // weather load
-  async function loadWeather(c) {
-    try {
-      setErr(""); setLoading(true);
-      const res = await fetchOneCall({ ...c, units });
-      setData(res);
-      setRainInfo(analyzeRainToday(res));
-    } catch (e) { setErr(e.message); }
-    finally { setLoading(false); }
+  // weather fetch
+async function loadWeather(c) {
+  try {
+    setErr(""); 
+    setLoading(true);
+    const res = await fetchOneCall({ ...c, units });
+    setData(res);
+    setRainInfo(analyzeRainToday(res)); // <-- we already analyze rain here
+    console.debug("Rain analysis:", analyzeRainToday(res), res.daily?.[0], res.hourly?.length); // <-- add here
+  } catch (e) { 
+    setErr(e.message); 
   }
+  finally { 
+    setLoading(false); 
+  }
+}
+
 
   // first location
   useEffect(() => {
