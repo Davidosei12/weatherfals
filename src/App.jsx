@@ -161,6 +161,12 @@ async function loadWeather(c) {
                 )}
               </div>
             )}
+            {import.meta.env.DEV && rainInfo && (
+  <pre className="muted" style={{ marginTop:8, fontSize:12, opacity:.7, overflowX:"auto" }}>
+    {JSON.stringify({ rainInfo, daily0: data?.daily?.[0], hourlyCount: data?.hourly?.length }, null, 2)}
+  </pre>
+)}
+
 
             {/* Ads */}
             {!!ads.length && (
