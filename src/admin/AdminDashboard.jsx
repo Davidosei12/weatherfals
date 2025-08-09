@@ -1,6 +1,7 @@
 // src/admin/AdminDashboard.jsx
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+
 import {
   // auth/guard
   watchAuth, adminLogout, isCurrentUserAdmin,
@@ -14,14 +15,11 @@ import {
   watchAds, saveAd, removeAdById,
   // uploads
   uploadAdAsset, deleteAdAsset,
-  // (optional) ad metrics
-  // logAdImpression, logAdClick,
 } from "../lib/firebaseStore";
 
 export default function AdminDashboard() {
   const nav = useNavigate();
 
-  // tabs
   const [tab, setTab] = useState("analytics");
 
   // analytics
@@ -41,14 +39,14 @@ export default function AdminDashboard() {
     title: "",
     linkUrl: "",
     active: true,
+    advertiser: "sponsor",
     mediaUrl: "",
     mediaPath: "",
     mediaType: "image", // "image" | "video"
-    advertiser: "sponsor"
   });
   const [uploading, setUploading] = useState(false);
 
-  // guard + live listeners
+  // ---- guard + live listeners ----
   useEffect(() => {
     const unsubAuth = watchAuth(async (u) => {
       if (!u || !(await isCurrentUserAdmin())) nav("/adminverifys/");
@@ -63,7 +61,6 @@ export default function AdminDashboard() {
     return () => { unsubAuth(); unA(); unU(); unS(); unAds(); };
   }, [nav]);
 
-  // totals
   const totals = useMemo(() => ({
     totalVisits: visits.length,
     uniqueUsers: new Set(visits.map(v => v.uid)).size,
@@ -71,13 +68,17 @@ export default function AdminDashboard() {
     latestVisit: visits[0]?.at?.toDate?.()?.toLocaleString?.() ?? "—"
   }), [visits, searches]);
 
-  // ---- SETTINGS ----
+  // ---- settings ----
   async function onSaveSettings() {
     await saveSettings(settings);
     alert("Settings saved");
   }
 
-  // ---- ADS ----
+  // ---- ads helpers ----
+  function missingFields() {
+    return ["title", "linkUrl", "mediaUrl"].filter(k => !String(adForm[k] || "").trim());
+  }
+
   async function onUploadFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -91,36 +92,49 @@ export default function AdminDashboard() {
         mediaType: up.mediaType
       }));
     } catch (err) {
-      console.error(err);
-      alert("Upload failed. Check Storage rules and try again.");
+      console.error("Upload failed:", err);
+      alert("Upload failed. Check Storage rules and that you’re signed in as admin.");
     } finally {
       setUploading(false);
-      e.target.value = ""; // reset input
+      e.target.value = "";
     }
   }
 
   async function onSaveAd() {
-    if (!adForm.title || !adForm.linkUrl || !adForm.mediaUrl) {
-      alert("Please fill Title, Link, and upload a file.");
+    const miss = missingFields();
+    if (miss.length) {
+      alert("Please fill " + miss.join(", ") + ".");
       return;
     }
-    await saveAd(adForm);
-    setAdForm({
-      id: null, title: "", linkUrl: "", active: true,
-      mediaUrl: "", mediaPath: "", mediaType: "image", advertiser: "sponsor"
-    });
+    try {
+      await saveAd(adForm);
+      setAdForm({
+        id: null,
+        title: "",
+        linkUrl: "",
+        active: true,
+        advertiser: "sponsor",
+        mediaUrl: "",
+        mediaPath: "",
+        mediaType: "image",
+      });
+      alert("Ad saved");
+    } catch (e) {
+      console.error("Save ad failed:", e);
+      alert("Could not save ad. Check Firestore rules and console.");
+    }
   }
 
-  async function onEditAd(a) {
+  function onEditAd(a) {
     setAdForm({
       id: a.id,
       title: a.title || "",
       linkUrl: a.linkUrl || "",
       active: !!a.active,
+      advertiser: a.advertiser || "sponsor",
       mediaUrl: a.mediaUrl || "",
       mediaPath: a.mediaPath || "",
       mediaType: a.mediaType || "image",
-      advertiser: a.advertiser || "sponsor"
     });
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -128,7 +142,9 @@ export default function AdminDashboard() {
   async function onDeleteAd(a) {
     if (!confirm("Delete this ad?")) return;
     try {
-      if (a.mediaPath) await deleteAdAsset(a.mediaPath);
+      if (a.mediaPath) {
+        try { await deleteAdAsset(a.mediaPath); } catch (e) { console.warn("Storage delete skipped:", e); }
+      }
       await removeAdById(a.id);
     } catch (e) {
       console.error(e);
@@ -158,7 +174,7 @@ export default function AdminDashboard() {
             <div className="section-title">Totals</div>
             <div className="row wrap" style={{ gap:10 }}>
               <div className="metric">Visits:&nbsp;<b>{totals.totalVisits}</b></div>
-              <div className="metric good">Unique Users:&nbsp;<b>{totals.uniqueUsers}</b></div>
+              <div className="metric good">Unique:&nbsp;<b>{totals.uniqueUsers}</b></div>
               <div className="metric">Searches:&nbsp;<b>{totals.searches}</b></div>
               <div className="metric warn">Latest:&nbsp;<b>{totals.latestVisit}</b></div>
             </div>
@@ -227,7 +243,7 @@ export default function AdminDashboard() {
               <input value={settings.siteName || ""} onChange={e=>setSettingsState(s=>({ ...s, siteName: e.target.value }))}/>
             </div>
             <div style={{ minWidth: 280 }}>
-              <label className="label">Logo URL (optional if using local / Firestore)</label>
+              <label className="label">Logo URL</label>
               <input value={settings.logoUrl || ""} onChange={e=>setSettingsState(s=>({ ...s, logoUrl: e.target.value }))}/>
             </div>
           </div>
@@ -243,16 +259,20 @@ export default function AdminDashboard() {
           {/* Form */}
           <div className="card">
             <div className="section-title">New / Edit Ad</div>
+
             <div className="row wrap" style={{ gap:10 }}>
-              <input placeholder="Title"
+              <input
+                placeholder="Title"
                 value={adForm.title}
                 onChange={e=>setAdForm(f=>({ ...f, title:e.target.value }))}
               />
-              <input placeholder="Link URL (https://…)"
+              <input
+                placeholder="Link URL (https://...)"
                 value={adForm.linkUrl}
                 onChange={e=>setAdForm(f=>({ ...f, linkUrl:e.target.value }))}
               />
-              <input placeholder="Advertiser (folder)"
+              <input
+                placeholder="Advertiser (folder)"
                 value={adForm.advertiser}
                 onChange={e=>setAdForm(f=>({ ...f, advertiser:e.target.value }))}
                 style={{ maxWidth:180 }}
@@ -267,24 +287,42 @@ export default function AdminDashboard() {
               </label>
             </div>
 
+            {/* Upload OR paste URL */}
             <div className="row wrap" style={{ gap:12, marginTop:10 }}>
+              <input type="file" accept="image/*,video/*" onChange={onUploadFile} />
               <input
-                type="file"
-                accept="image/*,video/*"
-                onChange={onUploadFile}
+                placeholder="Or paste media URL (image/video)"
+                value={adForm.mediaUrl}
+                onChange={e=>setAdForm(f=>({ ...f, mediaUrl:e.target.value }))}
+                style={{ minWidth: 320 }}
               />
               {uploading && <div className="muted">Uploading…</div>}
-              {adForm.mediaUrl && (
-                adForm.mediaType === "video"
-                ? <video src={adForm.mediaUrl} controls style={{ width:320, borderRadius:12 }} />
-                : <img src={adForm.mediaUrl} alt="preview" style={{ width:320, borderRadius:12 }} />
-              )}
+            </div>
+
+            {/* Preview */}
+            {adForm.mediaUrl && (
+              <div style={{ marginTop:10 }}>
+                {(adForm.mediaType === "video" || /\.mp4|\.webm|\.ogg$/i.test(adForm.mediaUrl))
+                  ? <video src={adForm.mediaUrl} controls style={{ width:360, borderRadius:12 }} />
+                  : <img src={adForm.mediaUrl} alt="preview" style={{ width:360, borderRadius:12 }} />}
+              </div>
+            )}
+
+            {/* Missing fields hint */}
+            <div className="muted" style={{ marginTop:10, fontSize:12 }}>
+              Missing: {missingFields().join(", ") || "none ✅"}
             </div>
 
             <div className="row space-between" style={{ marginTop:12 }}>
-              <button className="btn" onClick={()=>{
-                setAdForm({ id:null, title:"", linkUrl:"", active:true, mediaUrl:"", mediaPath:"", mediaType:"image", advertiser:"sponsor" });
-              }}>Clear</button>
+              <button
+                className="btn"
+                onClick={()=> setAdForm({
+                  id:null, title:"", linkUrl:"", active:true, advertiser:"sponsor",
+                  mediaUrl:"", mediaPath:"", mediaType:"image"
+                })}
+              >
+                Clear
+              </button>
               <button className="btn primary" onClick={onSaveAd}>
                 {adForm.id ? "Update Ad" : "Add Ad"}
               </button>
@@ -302,7 +340,7 @@ export default function AdminDashboard() {
                     {a.advertiser || "sponsor"} • {a.active ? "Active" : "Inactive"}
                   </div>
                   {a.mediaUrl && (
-                    a.mediaType === "video"
+                    a.mediaType === "video" || /\.mp4|\.webm|\.ogg$/i.test(a.mediaUrl)
                       ? <video src={a.mediaUrl} controls style={{ width:"100%", borderRadius:8, marginTop:6 }} />
                       : <img alt="" src={a.mediaUrl} style={{ width:"100%", borderRadius:8, marginTop:6 }} />
                   )}
