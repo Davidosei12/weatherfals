@@ -9,6 +9,7 @@ import WeatherCard from "./components/WeatherCard.jsx";
 import Forecast from "./components/Forecast.jsx";
 import Profile from "./components/Profile.jsx";
 import WelcomeToast from "./components/WelcomeToast.jsx";
+import AdPopup from "./components/AdPopup.jsx";
 
 import { fetchCoords, fetchOneCall, analyzeRainToday } from "./api.js";
 import {
@@ -143,6 +144,15 @@ function Home() {
     />
   </div>
 </header>
+
+  {/* Ads Popup */}
+      {(settings.adPopupEnabled ?? true) && (
+  <AdPopup
+    ads={ads.filter(a => a.active)}
+    intervalMs={((settings.adPopupIntervalSeconds ?? 51) * 1000)}
+    initialDelayMs={((settings.adPopupInitialDelaySeconds ?? 5) * 1000)}
+  />
+)}
 
 
       <main className="container">

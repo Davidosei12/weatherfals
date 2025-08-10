@@ -1,6 +1,7 @@
 // src/admin/AdminDashboard.jsx
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import AdPopup from "../components/AdPopup.jsx";
 
 import {
   // auth/guard
@@ -99,6 +100,20 @@ export default function AdminDashboard() {
       e.target.value = "";
     }
   }
+
+  // In the Ads tab UI:
+<button className="btn" onClick={() => setPreview(p => !p)}>
+  {preview ? "Close Preview" : "Preview Popup"}
+</button>
+
+{preview && (
+  <AdPopup
+    ads={ads.filter(a => a.active)}
+    intervalMs={999999}      // disable auto-loop during preview
+    initialDelayMs={0}
+    forceShow={true}         // show immediately
+  />
+)}
 
   async function onSaveAd() {
     const miss = missingFields();
