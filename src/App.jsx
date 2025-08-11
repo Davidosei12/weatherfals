@@ -23,7 +23,7 @@ const AdminDashboard = lazy(() => import("./admin/AdminDashboard.jsx"));
 
 function Home() {
   // Default to Fahrenheit
-  const [units, setUnits] = useState("imperial"); // "imperial" = °F, mph
+  const [units, setUnits] = useState("imperial"); // °F, mph
   const [place, setPlace] = useState("Accra, GH");
   const [coords, setCoords] = useState(null);
   const [data, setData] = useState(null);
@@ -35,25 +35,60 @@ function Home() {
   const [settings, setSettings] = useState({ siteName: "Weatherfals", logoUrl: "" });
   const [ads, setAds] = useState([]);
 
-  useEffect(() => {
-    ensureAnon().then(trackVisit);
+  // --- HOTFIX: never push base64 photos into Firestore ---
+  async function safeSyncProfileFromLocal() {
     try {
       const raw = localStorage.getItem("weather_profile");
-      if (raw) {
-        const p = JSON.parse(raw);
-        setProfile({ name: p.name || "", photo: p.photo || "" });
-        if (p.name) setShowWelcome(true);
-        upsertUserProfile({ name: p.name || "Guest", photo: p.photo || "" });
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      let photo = p.photo || "";
+
+      // If it's a data URL (base64), DROP it to avoid Firestore 1MB limit.
+      // (Later you can implement upload-to-Storage & store URL instead.)
+      if (typeof photo === "string" && photo.startsWith("data:")) {
+        photo = "";
+        // Also clean local cache so we don't try again next load
+        const cleaned = { ...p, photo: "" };
+        localStorage.setItem("weather_profile", JSON.stringify(cleaned));
       }
-    } catch {}
-  }, []);
 
+      setProfile({ name: p.name || "", photo });
+      if (p.name) setShowWelcome(true);
+
+      // Upsert *after* anon auth is ready (ensureAnon below)
+      await upsertUserProfile({ name: p.name || "Guest", photo });
+    } catch (e) {
+      // swallow so the app continues even if local data is weird
+      console.warn("safeSyncProfileFromLocal skipped:", e?.message || e);
+    }
+  }
+
+  // sign in anon first, then track visit, then safe profile sync
   useEffect(() => {
-    const unS = watchSettings(setSettings);
-    const unA = watchAds(setAds);
-    return () => { unS(); unA(); };
+    (async () => {
+      try {
+        await ensureAnon();       // make sure auth.currentUser exists
+        await trackVisit();       // record visit
+        await safeSyncProfileFromLocal(); // safe user profile write
+      } catch (e) {
+        console.warn("startup auth/visit failed:", e?.message || e);
+      }
+    })();
   }, []);
 
+  // watch site settings & ads from Firestore (public read in rules)
+  useEffect(() => {
+    let unS = () => {}, unA = () => {};
+    try {
+      unS = watchSettings(setSettings);
+      unA = watchAds(setAds);
+    } catch (e) {
+      console.warn("settings/ads listeners failed:", e?.message || e);
+    }
+    return () => { try { unS(); unA(); } catch {} };
+  }, []);
+
+  // dynamic background based on weather
   function getBgUrl(code, desc = "") {
     const text = (desc || "").toLowerCase();
     const u = (q) => `https://images.unsplash.com/${q}?auto=format&fit=crop&w=1920&q=80`;
@@ -85,16 +120,12 @@ function Home() {
 
   async function loadWeather(c) {
     try {
-      setErr("");
-      setLoading(true);
+      setErr(""); setLoading(true);
       const res = await fetchOneCall({ ...c, units });
       setData(res);
       setRainInfo(analyzeRainToday(res));
-    } catch (e) {
-      setErr(e.message);
-    } finally {
-      setLoading(false);
-    }
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
   }
 
   useEffect(() => {
@@ -119,41 +150,43 @@ function Home() {
     return <> (≈ {mm.toFixed(1)} mm)</>;
   };
 
+  // popup timing from settings with sane defaults
+  const popupEnabled = settings.adPopupEnabled ?? true;
+  const intervalMs = (settings.adPopupIntervalSeconds ?? 51) * 1000;
+  const initialDelayMs = (settings.adPopupInitialDelaySeconds ?? 5) * 1000;
+
   return (
     <div className="page">
       <WelcomeToast name={profile.name} show={showWelcome && !!profile.name} onClose={()=>setShowWelcome(false)} />
 
       <header className="header row space-between">
-  <div className="row" style={{ gap: 12 }}>
-    <img
-      alt="logo"
-      src={settings.logoUrl || "/weatherfals-logo.png"} // fallback to public logo
-      style={{ height: 32, borderRadius: 6 }}
-    />
-    <h1 className="logo">{settings.siteName || "Weatherfals"}</h1>
-    {profile?.name && <div className="hello muted">Hi, {profile.name}</div>}
-  </div>
-  <div className="row" style={{ gap: 12 }}>
-    <UnitToggle units={units} setUnits={setUnits} />
-    <Profile
-      profile={profile}
-      setProfile={(p) => {
-        setProfile(p);
-        upsertUserProfile({ name: p.name || "Guest", photo: p.photo || "" });
-      }}
-    />
-  </div>
-</header>
-
-  {/* Ads Popup */}
-      {(settings.adPopupEnabled ?? true) && (
-  <AdPopup
-    ads={ads.filter(a => a.active)}
-    intervalMs={((settings.adPopupIntervalSeconds ?? 51) * 1000)}
-    initialDelayMs={((settings.adPopupInitialDelaySeconds ?? 5) * 1000)}
-  />
-)}
-
+        <div className="row" style={{ gap: 12 }}>
+          <img
+            alt="logo"
+            src={settings.logoUrl || "/weatherfals-logo.png"} // fallback to /public file
+            style={{ height:32, borderRadius:6 }}
+          />
+          <h1 className="logo">{settings.siteName || "Weatherfals"}</h1>
+          {profile?.name && <div className="hello muted">Hi, {profile.name}</div>}
+        </div>
+        <div className="row" style={{ gap: 12 }}>
+          <UnitToggle units={units} setUnits={setUnits} />
+          <Profile
+            profile={profile}
+            setProfile={(p) => {
+              // Also keep local copy (but strip base64 so we don't re-trigger)
+              const clean = { name: p.name || "", photo: (typeof p.photo === "string" && p.photo.startsWith("data:")) ? "" : (p.photo || "") };
+              setProfile(clean);
+              try {
+                localStorage.setItem("weather_profile", JSON.stringify(clean));
+              } catch {}
+              // Firestore upsert (safe; no base64)
+              upsertUserProfile({ name: clean.name || "Guest", photo: clean.photo || "" })
+                .catch(e => console.warn("profile upsert failed:", e?.message || e));
+            }}
+          />
+        </div>
+      </header>
 
       <main className="container">
         <SearchBar onSearch={loadByCity} />
@@ -162,10 +195,8 @@ function Home() {
 
         {data && (
           <>
-            {/* Weather card should already switch to °F/mph based on units prop */}
             <WeatherCard place={place} current={data.current} units={units} />
 
-            {/* Rain today banner */}
             {rainInfo && (
               <div className="card" style={{ marginTop: 12 }}>
                 {rainInfo.willRain ? (
@@ -184,7 +215,7 @@ function Home() {
               </div>
             )}
 
-            {/* Ads */}
+            {/* Inline ads (keep) */}
             {!!ads.length && (
               <div className="grid" style={{ marginTop:12 }}>
                 {ads.map(a=>(
@@ -200,7 +231,6 @@ function Home() {
               </div>
             )}
 
-            {/* Forecast should also read units prop and show °F */}
             <Forecast daily={data.daily} units={units} />
 
             <div className="card" style={{ marginTop: 12 }}>
@@ -212,6 +242,15 @@ function Home() {
               </div>
             </div>
           </>
+        )}
+
+        {/* Popup ad every 51s (configurable in settings) */}
+        {popupEnabled && (
+          <AdPopup
+            ads={ads.filter(a => a.active)}
+            intervalMs={intervalMs}
+            initialDelayMs={initialDelayMs}
+          />
         )}
       </main>
     </div>
