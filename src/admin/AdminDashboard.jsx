@@ -1,39 +1,72 @@
 // src/admin/AdminDashboard.jsx
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { auth, db, storage } from "../firebase";
+import {
+  collection, doc, getDoc, onSnapshot, setDoc, updateDoc, addDoc, deleteDoc, serverTimestamp, query, orderBy
+} from "firebase/firestore";
+import {
+  ref, uploadBytesResumable, getDownloadURL
+} from "firebase/storage";
 import AdPopup from "../components/AdPopup.jsx";
 
-import {
-  // auth/guard
-  watchAuth, adminLogout, isCurrentUserAdmin,
-  // analytics
-  watchAnalytics,
-  // users
-  watchUsers, setUserBanned, removeUser, promoteToAdmin,
-  // settings
-  watchSettings, saveSettings,
-  // ads core
-  watchAds, saveAd, removeAdById,
-  // uploads
-  uploadAdAsset, deleteAdAsset,
-} from "../lib/firebaseStore";
+// -----------------------------
+// Helpers
+// -----------------------------
+function formatDate(ms) {
+  if (!ms) return "—";
+  const d = new Date(ms);
+  return d.toLocaleString();
+}
 
+function isVideoUrl(url = "") {
+  return /\.(mp4|webm|ogg)(\?|#|$)/i.test(url);
+}
+
+// -----------------------------
+// Admin guard hook
+// -----------------------------
+function useIsAdmin() {
+  const [isAdmin, setIsAdmin] = useState(null); // null = loading
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const uid = auth.currentUser?.uid;
+        if (!uid) {
+          setIsAdmin(false);
+          setErr("You are not signed in. Go to /adminverifys/ to sign in.");
+          return;
+        }
+        const snap = await getDoc(doc(db, "admins", uid));
+        if (!cancelled) setIsAdmin(snap.exists());
+        if (!snap.exists() && !cancelled) {
+          setErr("Admins only. Your UID is not in /admins.");
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setIsAdmin(false);
+          setErr(e?.message || "Failed to verify admin.");
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  return { isAdmin, err };
+}
+
+// -----------------------------
+// Main component
+// -----------------------------
 export default function AdminDashboard() {
-  const nav = useNavigate();
+  const { isAdmin, err: adminErr } = useIsAdmin();
 
-  const [tab, setTab] = useState("analytics");
+  // Tabs: ads / settings / users
+  const [tab, setTab] = useState("ads");
 
-  // analytics
-  const [visits, setVisits] = useState([]);
-  const [searches, setSearches] = useState([]);
-
-  // users
-  const [users, setUsers] = useState([]);
-
-  // settings
-  const [settings, setSettingsState] = useState({ siteName: "Weatherfals", logoUrl: "" });
-
-  // ads
+  // ---------- Ads state ----------
   const [ads, setAds] = useState([]);
   const [adForm, setAdForm] = useState({
     id: null,
@@ -41,108 +74,149 @@ export default function AdminDashboard() {
     linkUrl: "",
     active: true,
     advertiser: "sponsor",
-    mediaUrl: "",
-    mediaPath: "",
-    mediaType: "image", // "image" | "video"
+    mediaUrl: "",     // uploaded result URL
+    mediaPath: "",    // storage path (for deletes)
+    mediaType: "image",
+    externalUrl: ""   // optional external media
   });
   const [uploading, setUploading] = useState(false);
+  const [uploadPct, setUploadPct] = useState(0);
+  const [preview, setPreview] = useState(false); // Preview Popup toggle
 
-  // ---- guard + live listeners ----
+  // ---------- Settings state ----------
+  const [settings, setSettings] = useState({
+    siteName: "Weatherfals",
+    logoUrl: "/weatherfals-logo.png",
+    adPopupEnabled: true,
+    adPopupIntervalSeconds: 51,
+    adPopupInitialDelaySeconds: 5,
+  });
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+
+  // ---------- Users state (read-only) ----------
+  const [users, setUsers] = useState([]);
+
+  // Attach listeners only after we know user is admin
   useEffect(() => {
-    const unsubAuth = watchAuth(async (u) => {
-      if (!u || !(await isCurrentUserAdmin())) nav("/adminverifys/");
-    });
-    const unA = watchAnalytics(({ type, docs }) => {
-      if (type === "visits") setVisits(docs);
-      if (type === "searches") setSearches(docs);
-    });
-    const unU = watchUsers(setUsers);
-    const unS = watchSettings(setSettingsState);
-    const unAds = watchAds(setAds);
-    return () => { unsubAuth(); unA(); unU(); unS(); unAds(); };
-  }, [nav]);
+    if (isAdmin !== true) return;
+    const unsubs = [];
 
-  const totals = useMemo(() => ({
-    totalVisits: visits.length,
-    uniqueUsers: new Set(visits.map(v => v.uid)).size,
-    searches: searches.length,
-    latestVisit: visits[0]?.at?.toDate?.()?.toLocaleString?.() ?? "—"
-  }), [visits, searches]);
-
-  // ---- settings ----
-  async function onSaveSettings() {
-    await saveSettings(settings);
-    alert("Settings saved");
-  }
-
-  // ---- ads helpers ----
-  function missingFields() {
-    return ["title", "linkUrl", "mediaUrl"].filter(k => !String(adForm[k] || "").trim());
-  }
-
-  async function onUploadFile(e) {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    setUploading(true);
+    // Ads (ordered by createdAt desc if present)
     try {
-      const up = await uploadAdAsset(f, adForm.advertiser || "sponsor");
-      setAdForm(prev => ({
-        ...prev,
-        mediaUrl: up.url,
-        mediaPath: up.path,
-        mediaType: up.mediaType
-      }));
-    } catch (err) {
-      console.error("Upload failed:", err);
-      alert("Upload failed. Check Storage rules and that you’re signed in as admin.");
+      const qAds = query(collection(db, "ads"), orderBy("createdAt", "desc"));
+      const unA = onSnapshot(qAds, {
+        next: (snap) => {
+          const arr = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          setAds(arr);
+        },
+        error: (e) => console.warn("ads onSnapshot denied:", e.code, e.message)
+      });
+      unsubs.push(unA);
+    } catch (e) { console.warn("ads watch failed:", e?.message || e); }
+
+    // Settings (single doc: settings/site)
+    try {
+      const ref = doc(db, "settings", "site");
+      const unS = onSnapshot(ref, {
+        next: (snap) => {
+          if (snap.exists()) setSettings(prev => ({ ...prev, ...snap.data() }));
+          setSettingsLoaded(true);
+        },
+        error: (e) => { console.warn("settings watch denied:", e.code, e.message); setSettingsLoaded(true); }
+      });
+      unsubs.push(unS);
+    } catch (e) { console.warn("settings watch failed:", e?.message || e); setSettingsLoaded(true); }
+
+    // Users (optional; read-only)
+    try {
+      const qUsers = query(collection(db, "users"), orderBy("updatedAt", "desc"));
+      const unU = onSnapshot(qUsers, {
+        next: (snap) => {
+          const arr = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          setUsers(arr);
+        },
+        error: (e) => console.warn("users watch denied:", e.code, e.message)
+      });
+      unsubs.push(unU);
+    } catch (e) { console.warn("users watch failed:", e?.message || e); }
+
+    return () => unsubs.forEach(u => u && u());
+  }, [isAdmin]);
+
+  // ---------- Ads form helpers ----------
+  const missingFields = useMemo(() => {
+    const need = [];
+    if (!adForm.title.trim()) need.push("title");
+    if (!adForm.linkUrl.trim()) need.push("linkUrl");
+    const hasMedia = !!adForm.mediaUrl || !!adForm.externalUrl;
+    if (!hasMedia) need.push("media (upload or paste URL)");
+    return need;
+  }, [adForm]);
+
+  const canSaveAd = !uploading && missingFields.length === 0;
+
+  async function handleUploadFile(file) {
+    setUploading(true); setUploadPct(0);
+    try {
+      const ext = (file.name.split(".").pop() || "bin").toLowerCase();
+      const kind = file.type.startsWith("video/") || isVideoUrl(file.name) ? "video" : "image";
+      const path = `ads/${adForm.advertiser || "sponsor"}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+      const r = ref(storage, path);
+      const task = uploadBytesResumable(r, file, { contentType: file.type || (kind === "video" ? "video/mp4" : "image/jpeg") });
+      await new Promise((resolve, reject) => {
+        task.on("state_changed",
+          (snap) => {
+            const pct = Math.round((snap.bytesTransferred / snap.totalBytes) * 100);
+            setUploadPct(pct);
+          },
+          reject,
+          resolve
+        );
+      });
+      const url = await getDownloadURL(task.snapshot.ref);
+      setAdForm(f => ({ ...f, mediaUrl: url, mediaPath: path, mediaType: kind }));
+    } catch (e) {
+      alert(e?.message || "Upload failed");
     } finally {
-      setUploading(false);
-      e.target.value = "";
+      setUploading(false); setUploadPct(0);
     }
   }
 
-  // In the Ads tab UI:
-<button className="btn" onClick={() => setPreview(p => !p)}>
-  {preview ? "Close Preview" : "Preview Popup"}
-</button>
-
-{preview && (
-  <AdPopup
-    ads={ads.filter(a => a.active)}
-    intervalMs={999999}      // disable auto-loop during preview
-    initialDelayMs={0}
-    forceShow={true}         // show immediately
-  />
-)}
-
-  async function onSaveAd() {
-    const miss = missingFields();
-    if (miss.length) {
-      alert("Please fill " + miss.join(", ") + ".");
-      return;
-    }
+  async function saveAd() {
+    if (!canSaveAd) { alert("Please fill: " + missingFields.join(", ")); return; }
     try {
-      await saveAd(adForm);
+      const finalUrl = adForm.mediaUrl || adForm.externalUrl;
+      const finalType = adForm.mediaUrl ? adForm.mediaType : (isVideoUrl(adForm.externalUrl) ? "video" : "image");
+      const payload = {
+        title: adForm.title.trim(),
+        linkUrl: adForm.linkUrl.trim(),
+        active: !!adForm.active,
+        advertiser: adForm.advertiser || "sponsor",
+        mediaUrl: finalUrl,
+        mediaType: finalType,
+        mediaPath: adForm.mediaUrl ? adForm.mediaPath : "",
+        createdAt: serverTimestamp()
+      };
+      if (adForm.id) {
+        await updateDoc(doc(db, "ads", adForm.id), payload);
+      } else {
+        await addDoc(collection(db, "ads"), payload);
+      }
+      // reset (keep advertiser for quick multiple uploads)
       setAdForm({
-        id: null,
-        title: "",
-        linkUrl: "",
-        active: true,
-        advertiser: "sponsor",
-        mediaUrl: "",
-        mediaPath: "",
-        mediaType: "image",
+        id: null, title: "", linkUrl: "", active: true, advertiser: adForm.advertiser || "sponsor",
+        mediaUrl: "", mediaPath: "", mediaType: "image", externalUrl: ""
       });
       alert("Ad saved");
     } catch (e) {
-      console.error("Save ad failed:", e);
+      console.error("saveAd failed:", e);
       alert("Could not save ad. Check Firestore rules and console.");
     }
   }
 
-  function onEditAd(a) {
+  async function editAd(a) {
     setAdForm({
-      id: a.id,
+      id: a.id || null,
       title: a.title || "",
       linkUrl: a.linkUrl || "",
       active: !!a.active,
@@ -150,97 +224,167 @@ export default function AdminDashboard() {
       mediaUrl: a.mediaUrl || "",
       mediaPath: a.mediaPath || "",
       mediaType: a.mediaType || "image",
+      externalUrl: ""
     });
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
-  async function onDeleteAd(a) {
-    if (!confirm("Delete this ad?")) return;
+  async function removeAd(a) {
+    if (!confirm(`Delete ad “${a.title}”?`)) return;
     try {
-      if (a.mediaPath) {
-        try { await deleteAdAsset(a.mediaPath); } catch (e) { console.warn("Storage delete skipped:", e); }
-      }
-      await removeAdById(a.id);
+      await deleteDoc(doc(db, "ads", a.id));
+      alert("Ad deleted");
     } catch (e) {
-      console.error(e);
-      alert("Delete failed. Check Storage/Firestore permissions.");
+      console.error("delete ad failed:", e);
+      alert("Delete failed. Check permissions.");
     }
   }
 
+  // ---------- Settings save ----------
+  async function saveSettings() {
+    try {
+      await setDoc(doc(db, "settings", "site"), {
+        siteName: settings.siteName || "Weatherfals",
+        logoUrl: settings.logoUrl || "/weatherfals-logo.png",
+        adPopupEnabled: !!settings.adPopupEnabled,
+        adPopupIntervalSeconds: Number(settings.adPopupIntervalSeconds) || 51,
+        adPopupInitialDelaySeconds: Number(settings.adPopupInitialDelaySeconds) || 5,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+      alert("Settings saved");
+    } catch (e) {
+      console.error("save settings failed:", e);
+      alert("Could not save settings. Check rules and admin status.");
+    }
+  }
+
+  // ---------- UI ----------
+  if (isAdmin === null) {
+    return <div className="container"><div className="info" style={{ marginTop:16 }}>Checking admin…</div></div>;
+  }
+  if (isAdmin === false) {
+    return <div className="container">
+      <div className="error" style={{ marginTop:16 }}>
+        Admins only. {adminErr ? <span className="muted">({adminErr})</span> : null}
+      </div>
+    </div>;
+  }
+
+  const activeAds = ads.filter(a => a.active);
+
   return (
-    <div className="admin container" style={{ paddingTop: 24 }}>
-      <div className="row space-between">
-        <h2 style={{ margin: 0 }}>Welcome, Admin 👋</h2>
-        <button className="btn" onClick={adminLogout}>Logout</button>
+    <div className="container" style={{ paddingTop: 16 }}>
+      <h2>Admin Dashboard</h2>
+
+      {/* Tabs */}
+      <div className="row" style={{ gap:8, margin:"12px 0" }}>
+        <button className={tab==="ads"?"btn primary":"btn"} onClick={()=>setTab("ads")}>Ads</button>
+        <button className={tab==="settings"?"btn primary":"btn"} onClick={()=>setTab("settings")}>Settings</button>
+        <button className={tab==="users"?"btn primary":"btn"} onClick={()=>setTab("users")}>Users</button>
       </div>
 
-      <div className="tabs">
-        {["analytics","users","settings","ads"].map(k=>(
-          <button key={k} className={tab===k?"active":""} onClick={()=>setTab(k)}>
-            {k.toUpperCase()}
-          </button>
-        ))}
-      </div>
+      {/* ADS TAB */}
+      {tab === "ads" && (
+        <div className="card" style={{ padding:16 }}>
+          <h3>Manage Ads</h3>
 
-      {/* ANALYTICS */}
-      {tab==="analytics" && (
-        <div className="grid">
-          <div className="card">
-            <div className="section-title">Totals</div>
-            <div className="row wrap" style={{ gap:10 }}>
-              <div className="metric">Visits:&nbsp;<b>{totals.totalVisits}</b></div>
-              <div className="metric good">Unique:&nbsp;<b>{totals.uniqueUsers}</b></div>
-              <div className="metric">Searches:&nbsp;<b>{totals.searches}</b></div>
-              <div className="metric warn">Latest:&nbsp;<b>{totals.latestVisit}</b></div>
+          <div className="grid" style={{ gridTemplateColumns:"1fr 1fr", gap:12 }}>
+            <div>
+              <input
+                placeholder="Title"
+                value={adForm.title}
+                onChange={e=>setAdForm(f=>({ ...f, title:e.target.value }))}
+              />
+              <input
+                placeholder="Link URL (when clicked)"
+                value={adForm.linkUrl}
+                onChange={e=>setAdForm(f=>({ ...f, linkUrl:e.target.value }))}
+              />
+              <div className="row" style={{ gap:8, alignItems:"center", margin:"8px 0" }}>
+                <label><input type="checkbox" checked={adForm.active} onChange={e=>setAdForm(f=>({ ...f, active:e.target.checked }))}/> Active</label>
+                <select value={adForm.advertiser} onChange={e=>setAdForm(f=>({ ...f, advertiser:e.target.value }))}>
+                  <option value="sponsor">sponsor</option>
+                  <option value="house">house</option>
+                </select>
+              </div>
+
+              <div style={{ marginTop:6 }}>
+                <div className="muted" style={{ marginBottom:6 }}>Upload image/video OR paste an external URL</div>
+                <input
+                  type="file"
+                  accept="image/*,video/*"
+                  onChange={e=>{
+                    const f = e.target.files?.[0];
+                    if (f) handleUploadFile(f);
+                    e.target.value = "";
+                  }}
+                />
+                {uploading && <div className="muted">Uploading… {uploadPct}%</div>}
+                <input
+                  placeholder="Or paste external media URL (optional)"
+                  value={adForm.externalUrl}
+                  onChange={e=>setAdForm(f=>({ ...f, externalUrl:e.target.value }))}
+                  style={{ marginTop:6 }}
+                />
+              </div>
+
+              <div className="row" style={{ gap:8, marginTop:10 }}>
+                <button className="btn primary" disabled={!canSaveAd} onClick={saveAd}>
+                  {adForm.id ? "Update Ad" : "Add Ad"}
+                </button>
+                <button className="btn" onClick={()=>{
+                  setAdForm({
+                    id:null, title:"", linkUrl:"", active:true, advertiser: adForm.advertiser || "sponsor",
+                    mediaUrl:"", mediaPath:"", mediaType:"image", externalUrl:""
+                  });
+                }}>Clear</button>
+
+                {/* Preview Popup */}
+                <button className="btn" onClick={() => setPreview(p => !p)}>
+                  {preview ? "Close Preview" : "Preview Popup"}
+                </button>
+              </div>
+
+              <div className="muted" style={{ marginTop:8, fontSize:12 }}>
+                Missing: {missingFields.join(", ") || "none ✅"}
+              </div>
+            </div>
+
+            {/* Preview of current form media */}
+            <div>
+              <div className="muted" style={{ marginBottom:6 }}>Media Preview</div>
+              {(() => {
+                const url = adForm.mediaUrl || adForm.externalUrl;
+                if (!url) return <div className="muted">No media selected</div>;
+                const vid = isVideoUrl(url) || adForm.mediaType === "video";
+                return vid
+                  ? <video src={url} controls style={{ width:"100%", borderRadius:12 }} />
+                  : <img src={url} alt="preview" style={{ width:"100%", borderRadius:12 }} />;
+              })()}
             </div>
           </div>
 
-          <div className="card">
-            <div className="section-title">Latest Visits</div>
-            <ul style={{ margin:0, paddingLeft:18 }}>
-              {visits.slice(0,12).map(v=>(
-                <li key={v.id}>{v.uid?.slice(0,6)}… — {v.at?.toDate?.()?.toLocaleString?.() ?? "—"}</li>
-              ))}
-            </ul>
-          </div>
+          <hr style={{ margin:"16px 0", opacity:.2 }} />
 
-          <div className="card">
-            <div className="section-title">Latest Searches</div>
-            <ul style={{ margin:0, paddingLeft:18 }}>
-              {searches.slice(0,12).map(s=>(
-                <li key={s.id}><b>{s.q}</b> — {s.uid?.slice(0,6)}… — {s.at?.toDate?.()?.toLocaleString?.() ?? "—"}</li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      )}
-
-      {/* USERS */}
-      {tab==="users" && (
-        <div className="card">
-          <div className="section-title">User Management</div>
-          <div className="table">
-            <div className="thead">
-              <div>UID</div><div>Name</div><div>Status</div><div>Actions</div>
-            </div>
-            {users.map(u=>(
-              <div key={u.id} className="trow" style={{ gridTemplateColumns: "1.1fr 1fr 1fr 1.6fr" }}>
-                <div>{u.id.slice(0,8)}…</div>
-                <div>{u.name || "Guest"}</div>
-                <div>
-                  {u.banned
-                    ? <span className="badge banned">BANNED</span>
-                    : <span className="badge active">ACTIVE</span>}
-                  {u.isAdmin && <span className="badge admin" style={{ marginLeft:8 }}>ADMIN</span>}
+          <div className="muted" style={{ marginBottom:6 }}>Existing Ads</div>
+          <div className="grid" style={{ gridTemplateColumns:"repeat(auto-fill, minmax(220px, 1fr))", gap:12 }}>
+            {ads.map(a=>(
+              <div key={a.id} className="card mini">
+                <div className="row space-between">
+                  <b style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:140 }}>{a.title || "Untitled"}</b>
+                  <span className={`badge ${a.active ? "active" : "banned"}`}>{a.active ? "ACTIVE" : "OFF"}</span>
                 </div>
-                <div className="row wrap" style={{ gap:8 }}>
-                  <button className="btn warn" onClick={()=> setUserBanned(u.id, !u.banned)}>
-                    {u.banned ? "Unban" : "Ban"}
-                  </button>
-                  <button className="btn danger" onClick={()=> removeUser(u.id)}>Remove</button>
-                  {!u.isAdmin && (
-                    <button className="btn primary" onClick={()=> promoteToAdmin(u.id)}>Make Admin</button>
-                  )}
+                <div className="muted" style={{ fontSize:12, marginTop:4 }}>{a.advertiser || "sponsor"} · {formatDate(a.createdAt?.toMillis?.() || a.createdAt)}</div>
+                <div style={{ marginTop:8 }}>
+                  {a.mediaUrl ? (
+                    isVideoUrl(a.mediaUrl) || a.mediaType === "video"
+                      ? <video src={a.mediaUrl} controls style={{ width:"100%", borderRadius:8 }} />
+                      : <img src={a.mediaUrl} alt="" style={{ width:"100%", borderRadius:8 }} />
+                  ) : <div className="muted">No media</div>}
+                </div>
+                <div className="row" style={{ gap:6, marginTop:8 }}>
+                  <button className="btn" onClick={()=>editAd(a)}>Edit</button>
+                  <button className="btn danger" onClick={()=>removeAd(a)}>Delete</button>
                 </div>
               </div>
             ))}
@@ -248,130 +392,105 @@ export default function AdminDashboard() {
         </div>
       )}
 
-      {/* SETTINGS */}
-      {tab==="settings" && (
-        <div className="card">
-          <div className="section-title">Website Settings</div>
-          <div className="row wrap" style={{ gap:12 }}>
-            <div style={{ minWidth: 280 }}>
-              <label className="label">Site Name</label>
-              <input value={settings.siteName || ""} onChange={e=>setSettingsState(s=>({ ...s, siteName: e.target.value }))}/>
+      {/* SETTINGS TAB */}
+      {tab === "settings" && (
+        <div className="card" style={{ padding:16 }}>
+          <h3>Site Settings</h3>
+
+          {!settingsLoaded && <div className="muted">Loading…</div>}
+
+          <div className="grid" style={{ gridTemplateColumns:"1fr 1fr", gap:12 }}>
+            <div>
+              <label className="muted">Site name</label>
+              <input
+                value={settings.siteName}
+                onChange={e=>setSettings(s=>({ ...s, siteName:e.target.value }))}
+              />
+              <label className="muted" style={{ marginTop:8 }}>Logo URL</label>
+              <input
+                value={settings.logoUrl}
+                onChange={e=>setSettings(s=>({ ...s, logoUrl:e.target.value }))}
+                placeholder="/weatherfals-logo.png"
+              />
+
+              <div className="row" style={{ gap:8, marginTop:12 }}>
+                <label><input type="checkbox" checked={!!settings.adPopupEnabled} onChange={e=>setSettings(s=>({ ...s, adPopupEnabled:e.target.checked }))}/> Enable popup ads</label>
+              </div>
+
+              <div className="row" style={{ gap:8, marginTop:8 }}>
+                <input
+                  type="number"
+                  min={10}
+                  value={settings.adPopupIntervalSeconds}
+                  onChange={e=>setSettings(s=>({ ...s, adPopupIntervalSeconds:Number(e.target.value) }))}
+                />
+                <span className="muted">Interval (seconds)</span>
+              </div>
+              <div className="row" style={{ gap:8, marginTop:8 }}>
+                <input
+                  type="number"
+                  min={0}
+                  value={settings.adPopupInitialDelaySeconds}
+                  onChange={e=>setSettings(s=>({ ...s, adPopupInitialDelaySeconds:Number(e.target.value) }))}
+                />
+                <span className="muted">Initial delay (seconds)</span>
+              </div>
+
+              <div className="row" style={{ gap:8, marginTop:12 }}>
+                <button className="btn primary" onClick={saveSettings}>Save Settings</button>
+              </div>
             </div>
-            <div style={{ minWidth: 280 }}>
-              <label className="label">Logo URL</label>
-              <input value={settings.logoUrl || ""} onChange={e=>setSettingsState(s=>({ ...s, logoUrl: e.target.value }))}/>
+
+            <div>
+              <div className="muted">Logo Preview</div>
+              <div style={{ marginTop:6 }}>
+                <img
+                  alt="logo"
+                  src={settings.logoUrl || "/weatherfals-logo.png"}
+                  style={{ height:56, borderRadius:8, background:"#fff", padding:6 }}
+                  onError={(e)=>{ e.currentTarget.src="/weatherfals-logo.png"; }}
+                />
+              </div>
             </div>
-          </div>
-          <div style={{ marginTop: 12 }}>
-            <button className="btn primary" onClick={onSaveSettings}>Save Settings</button>
           </div>
         </div>
       )}
 
-      {/* ADS */}
-      {tab==="ads" && (
-        <div className="grid">
-          {/* Form */}
-          <div className="card">
-            <div className="section-title">New / Edit Ad</div>
-
-            <div className="row wrap" style={{ gap:10 }}>
-              <input
-                placeholder="Title"
-                value={adForm.title}
-                onChange={e=>setAdForm(f=>({ ...f, title:e.target.value }))}
-              />
-              <input
-                placeholder="Link URL (https://...)"
-                value={adForm.linkUrl}
-                onChange={e=>setAdForm(f=>({ ...f, linkUrl:e.target.value }))}
-              />
-              <input
-                placeholder="Advertiser (folder)"
-                value={adForm.advertiser}
-                onChange={e=>setAdForm(f=>({ ...f, advertiser:e.target.value }))}
-                style={{ maxWidth:180 }}
-              />
-              <label style={{ display:"flex", alignItems:"center", gap:8 }}>
-                <input
-                  type="checkbox"
-                  checked={!!adForm.active}
-                  onChange={e=>setAdForm(f=>({ ...f, active:e.target.checked }))}
-                />
-                Active
-              </label>
-            </div>
-
-            {/* Upload OR paste URL */}
-            <div className="row wrap" style={{ gap:12, marginTop:10 }}>
-              <input type="file" accept="image/*,video/*" onChange={onUploadFile} />
-              <input
-                placeholder="Or paste media URL (image/video)"
-                value={adForm.mediaUrl}
-                onChange={e=>setAdForm(f=>({ ...f, mediaUrl:e.target.value }))}
-                style={{ minWidth: 320 }}
-              />
-              {uploading && <div className="muted">Uploading…</div>}
-            </div>
-
-            {/* Preview */}
-            {adForm.mediaUrl && (
-              <div style={{ marginTop:10 }}>
-                {(adForm.mediaType === "video" || /\.mp4|\.webm|\.ogg$/i.test(adForm.mediaUrl))
-                  ? <video src={adForm.mediaUrl} controls style={{ width:360, borderRadius:12 }} />
-                  : <img src={adForm.mediaUrl} alt="preview" style={{ width:360, borderRadius:12 }} />}
-              </div>
-            )}
-
-            {/* Missing fields hint */}
-            <div className="muted" style={{ marginTop:10, fontSize:12 }}>
-              Missing: {missingFields().join(", ") || "none ✅"}
-            </div>
-
-            <div className="row space-between" style={{ marginTop:12 }}>
-              <button
-                className="btn"
-                onClick={()=> setAdForm({
-                  id:null, title:"", linkUrl:"", active:true, advertiser:"sponsor",
-                  mediaUrl:"", mediaPath:"", mediaType:"image"
-                })}
-              >
-                Clear
-              </button>
-              <button className="btn primary" onClick={onSaveAd}>
-                {adForm.id ? "Update Ad" : "Add Ad"}
-              </button>
-            </div>
-          </div>
-
-          {/* List */}
-          <div className="card">
-            <div className="section-title">Ads</div>
-            <div className="grid">
-              {ads.map(a=>(
-                <div key={a.id} className="card mini">
-                  <div style={{ fontWeight:700 }}>{a.title}</div>
-                  <div className="muted" style={{ fontSize:12, marginTop:4 }}>
-                    {a.advertiser || "sponsor"} • {a.active ? "Active" : "Inactive"}
-                  </div>
-                  {a.mediaUrl && (
-                    a.mediaType === "video" || /\.mp4|\.webm|\.ogg$/i.test(a.mediaUrl)
-                      ? <video src={a.mediaUrl} controls style={{ width:"100%", borderRadius:8, marginTop:6 }} />
-                      : <img alt="" src={a.mediaUrl} style={{ width:"100%", borderRadius:8, marginTop:6 }} />
+      {/* USERS TAB (read-only list) */}
+      {tab === "users" && (
+        <div className="card" style={{ padding:16 }}>
+          <h3>Users</h3>
+          <div className="grid" style={{ gridTemplateColumns:"repeat(auto-fill, minmax(240px,1fr))", gap:12 }}>
+            {users.map(u=>(
+              <div key={u.id} className="card mini">
+                <div className="row" style={{ gap:8 }}>
+                  {u.photo ? (
+                    <img src={u.photo} alt="" style={{ height:36, width:36, borderRadius:"50%", objectFit:"cover" }} />
+                  ) : (
+                    <div style={{ height:36, width:36, borderRadius:"50%", background:"#ddd" }} />
                   )}
-                  <div className="muted" style={{ fontSize:12, marginTop:6, wordBreak:"break-all" }}>
-                    {a.linkUrl}
-                  </div>
-                  <div className="row wrap" style={{ marginTop:8, gap:8 }}>
-                    <button className="btn" onClick={()=>onEditAd(a)}>Edit</button>
-                    <button className="btn danger" onClick={()=>onDeleteAd(a)}>Delete</button>
+                  <div>
+                    <div><b>{u.name || "Guest"}</b></div>
+                    <div className="muted" style={{ fontSize:12 }}>{u.id}</div>
                   </div>
                 </div>
-              ))}
-              {!ads.length && <div className="muted">No ads yet</div>}
-            </div>
+                <div className="muted" style={{ fontSize:12, marginTop:6 }}>
+                  Updated: {formatDate(u.updatedAt?.toMillis?.() || u.updatedAt)}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
+      )}
+
+      {/* Inline Preview Popup (admin-only; shows one immediately) */}
+      {preview && (
+        <AdPopup
+          ads={activeAds}
+          intervalMs={999999}
+          initialDelayMs={0}
+          forceShow={true}
+        />
       )}
     </div>
   );
